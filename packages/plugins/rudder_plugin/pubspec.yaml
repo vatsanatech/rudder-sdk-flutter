@@ -14,7 +14,11 @@ dependencies:
   flutter:
     sdk: flutter
   rudder_sdk_flutter_platform_interface: ^3.3.0
-  rudder_plugin_android: ^3.2.0
+  rudder_plugin_android:
+    git:
+      url: https://github.com/vatsanatech/rudder-sdk-flutter.git
+      ref: develop
+      path: packages/plugins/rudder_plugin_android
   rudder_plugin_ios: ^3.2.0
   rudder_plugin_web: ^3.2.0
 dev_dependencies:
