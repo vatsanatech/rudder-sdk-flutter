@@ -364,7 +364,7 @@ public class RudderSdkFlutterPlugin implements FlutterPlugin, MethodCallHandler 
 
   public void trackApplicationOpened(boolean fromBackground) {
     if (autoTrackLifeCycleEvents) {
-      if (fromBackground and this.userSessionManager != null) {
+      if (fromBackground && this.userSessionManager != null) {
         this.userSessionManager.startAutoSessionIfCurrentIsExpired();
       }
       RudderProperty property = new RudderProperty();
