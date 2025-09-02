@@ -226,7 +226,7 @@ public class RudderSdkFlutterPlugin implements FlutterPlugin, MethodCallHandler 
       traits.putId(userId);
     }
     RudderClient.getInstance().identify(traits, options);
-    userSessionManager.updateLastEventTimestamp();
+    if(userSessionManager != null) userSessionManager.updateLastEventTimestamp();
   }
 
   private void track(@NonNull MethodCall call) {
@@ -242,7 +242,7 @@ public class RudderSdkFlutterPlugin implements FlutterPlugin, MethodCallHandler 
       options = getRudderOptionsObject((Map<String, Object>) argumentsMap.get(OPTIONS));
     }
     RudderClient.getInstance().track(eventName, eventProperties, options);
-    userSessionManager.updateLastEventTimestamp();
+    if(userSessionManager != null) userSessionManager.updateLastEventTimestamp();
   }
 
   private void screen(@NonNull MethodCall call) {
@@ -263,7 +263,7 @@ public class RudderSdkFlutterPlugin implements FlutterPlugin, MethodCallHandler 
     } else {
       RudderClient.getInstance().screen(screenName, screenProperties, options);
     }
-    userSessionManager.updateLastEventTimestamp();
+    if(userSessionManager != null) userSessionManager.updateLastEventTimestamp();
   }
 
   private void group(@NonNull MethodCall call) {
@@ -278,7 +278,7 @@ public class RudderSdkFlutterPlugin implements FlutterPlugin, MethodCallHandler 
       options = getRudderOptionsObject((Map<String, Object>) argumentsMap.get(OPTIONS));
     }
     RudderClient.getInstance().group(groupId, groupTraits, options);
-    userSessionManager.updateLastEventTimestamp();
+    if(userSessionManager != null) userSessionManager.updateLastEventTimestamp();
   }
 
   private void alias(@NonNull MethodCall call) {
@@ -288,7 +288,7 @@ public class RudderSdkFlutterPlugin implements FlutterPlugin, MethodCallHandler 
       options = getRudderOptionsObject((Map<String, Object>) argumentsMap.get(OPTIONS));
     }
     RudderClient.getInstance().alias((String) argumentsMap.get("newId"), options);
-    userSessionManager.updateLastEventTimestamp();
+    if(userSessionManager != null) userSessionManager.updateLastEventTimestamp();
   }
 
   private static void reset(@NonNull MethodCall call) {
@@ -315,7 +315,7 @@ public class RudderSdkFlutterPlugin implements FlutterPlugin, MethodCallHandler 
     } else {
       RudderClient.getInstance().startSession();
     }
-    this.userSessionManager.clearAutoSessionStatus();
+    if(this.userSessionManager != null) this.userSessionManager.clearAutoSessionStatus();
   }
 
   private void endSession() {
@@ -364,20 +364,20 @@ public class RudderSdkFlutterPlugin implements FlutterPlugin, MethodCallHandler 
 
   public void trackApplicationOpened(boolean fromBackground) {
     if (autoTrackLifeCycleEvents) {
-      if (fromBackground) {
+      if (fromBackground and this.userSessionManager != null) {
         this.userSessionManager.startAutoSessionIfCurrentIsExpired();
       }
       RudderProperty property = new RudderProperty();
       property.put("from_background", fromBackground);
       RudderClient.getInstance().track("Application Opened", property);
-      this.userSessionManager.updateLastEventTimestamp();
+      if(this.userSessionManager != null) this.userSessionManager.updateLastEventTimestamp();
     }
   }
 
   public void trackApplicationBackgrounded() {
     if (autoTrackLifeCycleEvents) {
       RudderClient.getInstance().track("Application Backgrounded");
-      this.userSessionManager.updateLastEventTimestamp();
+      if(this.userSessionManager != null) this.userSessionManager.updateLastEventTimestamp();
     }
   }
 
@@ -386,7 +386,7 @@ public class RudderSdkFlutterPlugin implements FlutterPlugin, MethodCallHandler 
       RudderProperty property = new RudderProperty();
       property.put("automatic", true);
       RudderClient.getInstance().screen(screenName, property);
-      this.userSessionManager.updateLastEventTimestamp();
+      if(this.userSessionManager != null) this.userSessionManager.updateLastEventTimestamp();
     }
   }
 
@@ -396,7 +396,7 @@ public class RudderSdkFlutterPlugin implements FlutterPlugin, MethodCallHandler 
       activityLifeCycleManager.unregister();
       activityLifeCycleManager = null;
     }
-    userSessionManager = null;
+    if(userSessionManager != null) userSessionManager = null;
     channel.setMethodCallHandler(null);
   }
 
