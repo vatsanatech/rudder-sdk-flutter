@@ -33,9 +33,9 @@ import java.util.concurrent.Executors;
  * batch, instead of writing it to the SDK's database and waiting for the next flush.
  *
  * <p>The message is built by the SDK's own builder and serializer, so it has the same shape, message ID, context and
- * identity as a queued one. Any failure (no network, timeout, non-2xx) hands the same message to the SDK queue, which
- * persists and retries it. A message is kept in a small pending store while its request is in flight, and pending
- * messages are queued on the next initialization, so a process killed mid-request loses nothing.
+ * identity as a queued one. It is written to a small pending store before anything else, so it survives the process
+ * being killed while it waits or is in flight; pending messages are sent on the next initialization. Any failure
+ * (no network, timeout, non-2xx) hands the message to the SDK queue, which persists and retries it.
  */
 final class ImmediateEventDispatcher {
   static final String SEND_IMMEDIATELY = "sendImmediately";
@@ -47,7 +47,9 @@ final class ImmediateEventDispatcher {
   private static final int CONNECT_TIMEOUT_MS = 3000;
   private static final int READ_TIMEOUT_MS = 5000;
 
-  private final ExecutorService executor = Executors.newSingleThreadExecutor();
+  // Sends run one at a time so the keep-alive connection is reused; the warm-up never delays them.
+  private final ExecutorService sender = Executors.newSingleThreadExecutor();
+  private final ExecutorService warmer = Executors.newSingleThreadExecutor();
   private final SharedPreferences pending;
   private final SharedPreferences rudderPrefs;
   private final String authorization;
@@ -64,12 +66,16 @@ final class ImmediateEventDispatcher {
     this.healthUrl = base + "health";
   }
 
+  static boolean isImmediate(Map<String, Object> properties) {
+    return properties != null && Boolean.TRUE.equals(properties.get(SEND_IMMEDIATELY));
+  }
+
   /**
    * Opens the connection to the data plane in the background, so the first immediate event at a cold start does not
    * pay for DNS, TCP and TLS. The kept-alive connection is reused by the next request.
    */
   void warmUp() {
-    executor.execute(new Runnable() {
+    warmer.execute(new Runnable() {
       @Override
       public void run() {
         try {
@@ -84,69 +90,64 @@ final class ImmediateEventDispatcher {
     });
   }
 
-  static boolean isImmediate(Map<String, Object> properties) {
-    return properties != null && Boolean.TRUE.equals(properties.get(SEND_IMMEDIATELY));
-  }
-
   void track(String eventName, Map<String, Object> properties, RudderOption options) {
     RudderMessageBuilder builder = new RudderMessageBuilder().setEventName(eventName).setProperty(properties);
     if (options != null) builder.setRudderOption(options);
     final RudderMessage message = builder.build();
-    final long trackedAt = SystemClock.elapsedRealtime();
-    executor.execute(new Runnable() {
-      @Override
-      public void run() {
-        send(message, trackedAt);
-      }
-    });
-  }
-
-  /** Queues messages whose request never completed, e.g. because the process was killed. */
-  void requeuePending() {
-    executor.execute(new Runnable() {
-      @Override
-      public void run() {
-        for (Map.Entry<String, ?> entry : pending.getAll().entrySet()) {
-          try {
-            RudderMessage message = RudderGson.deserialize(String.valueOf(entry.getValue()), RudderMessage.class);
-            if (message != null) RudderClient.getInstance().track(message);
-          } catch (Exception e) {
-            RudderLogger.logError(e);
-          }
-          pending.edit().remove(entry.getKey()).commit();
-        }
-      }
-    });
-  }
-
-  private void send(RudderMessage message, long trackedAt) {
-    String messageJson = RudderGson.serialize(message);
-    JsonObject event = messageJson == null ? null : JsonParser.parseString(messageJson).getAsJsonObject();
-    String messageId = event != null && event.has("messageId") ? event.get("messageId").getAsString() : null;
+    final JsonObject event = toEvent(message);
+    final String messageId = event != null && event.has("messageId") ? event.get("messageId").getAsString() : null;
     if (messageId == null || rudderPrefs.getBoolean(RUDDER_OPT_STATUS_KEY, false)) {
       // Opted out (the SDK drops it) or unserializable: the SDK path decides.
       RudderClient.getInstance().track(message);
       return;
     }
-    pending.edit().putString(messageId, messageJson).commit();
-    boolean delivered = false;
-    try {
-      delivered = post(batchBody(event));
-    } catch (Exception e) {
-      RudderLogger.logWarn("ImmediateEventDispatcher: " + message.getEventName() + " queued after " + e);
-    }
-    if (delivered) {
-      String line = "ImmediateEventDispatcher: " + message.getEventName() + " delivered in "
-          + (SystemClock.elapsedRealtime() - trackedAt) + " ms";
-      RudderLogger.logDebug(line);
-    } else {
-      RudderClient.getInstance().track(message);
-    }
-    pending.edit().remove(messageId).commit();
+    pending.edit().putString(messageId, event.toString()).apply();
+    final long trackedAt = SystemClock.elapsedRealtime();
+    sender.execute(new Runnable() {
+      @Override
+      public void run() {
+        if (deliver(event)) {
+          RudderLogger.logDebug("ImmediateEventDispatcher: " + message.getEventName() + " delivered in "
+              + (SystemClock.elapsedRealtime() - trackedAt) + " ms");
+        } else {
+          RudderClient.getInstance().track(message);
+        }
+        pending.edit().remove(messageId).apply();
+      }
+    });
   }
 
-  // The fields the SDK adds while processing a queued message, which a directly sent one would otherwise lack.
-  private String batchBody(JsonObject event) {
+  /**
+   * Sends messages a killed process left pending, exactly as they were stored (same session and context); one that
+   * still fails is handed to the SDK queue.
+   */
+  void sendPending() {
+    final Map<String, ?> stored = pending.getAll();
+    if (stored.isEmpty()) return;
+    sender.execute(new Runnable() {
+      @Override
+      public void run() {
+        for (Map.Entry<String, ?> entry : stored.entrySet()) {
+          try {
+            JsonObject event = JsonParser.parseString(String.valueOf(entry.getValue())).getAsJsonObject();
+            if (!deliver(event)) {
+              RudderMessage message = RudderGson.deserialize(event.toString(), RudderMessage.class);
+              if (message != null) RudderClient.getInstance().track(message);
+            }
+          } catch (Exception e) {
+            RudderLogger.logError(e);
+          }
+          pending.edit().remove(entry.getKey()).apply();
+        }
+      }
+    });
+  }
+
+  // The message as the SDK would upload it, with the fields the SDK adds while processing a queued message.
+  private static JsonObject toEvent(RudderMessage message) {
+    String messageJson = RudderGson.serialize(message);
+    if (messageJson == null) return null;
+    JsonObject event = JsonParser.parseString(messageJson).getAsJsonObject();
     event.addProperty("type", "track");
     if (!event.has("integrations") || event.getAsJsonObject("integrations").size() == 0) {
       JsonObject integrations = new JsonObject();
@@ -157,14 +158,23 @@ final class ImmediateEventDispatcher {
     if (sessionId != null && event.has("context")) {
       event.getAsJsonObject("context").addProperty("sessionId", sessionId);
     }
-    String sentAt = timestamp();
-    event.addProperty("sentAt", sentAt);
-    JsonObject batch = new JsonObject();
-    batch.addProperty("sentAt", sentAt);
-    JsonArray events = new JsonArray();
-    events.add(event);
-    batch.add("batch", events);
-    return batch.toString();
+    return event;
+  }
+
+  private boolean deliver(JsonObject event) {
+    try {
+      String sentAt = timestamp();
+      event.addProperty("sentAt", sentAt);
+      JsonArray events = new JsonArray();
+      events.add(event);
+      JsonObject batch = new JsonObject();
+      batch.addProperty("sentAt", sentAt);
+      batch.add("batch", events);
+      return post(batch.toString());
+    } catch (Exception e) {
+      RudderLogger.logWarn("ImmediateEventDispatcher: queued after " + e);
+      return false;
+    }
   }
 
   private boolean post(String body) throws Exception {

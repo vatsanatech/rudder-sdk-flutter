@@ -53,16 +53,15 @@ BOOL isRegistrarDetached = NO;
         [RSClient getInstance:[call.arguments objectForKey:@"writeKey"]
                        config:config
                       options:[self getRudderOptionsObject:[call.arguments objectForKey:@"options"]]];
-        if (config.dataPlaneUrl != nil) {
+        // Once per process: a second initialization (hot restart, another engine) keeps the first dispatcher.
+        if (_immediateEventDispatcher == nil && config.dataPlaneUrl != nil) {
             _immediateEventDispatcher = [[RSImmediateEventDispatcher alloc]
                                          initWithWriteKey:[call.arguments objectForKey:@"writeKey"]
                                          dataPlaneUrl:config.dataPlaneUrl];
             [_immediateEventDispatcher warmUp];
-            [_immediateEventDispatcher requeuePending];
+            [_immediateEventDispatcher sendPending];
         }
-        if (_notification != nil) {
-            [[RSClient sharedInstance] trackLifecycleEvents:_notification.userInfo];
-        }
+        [[RSClient sharedInstance] trackLifecycleEvents:_notification.userInfo];
         return;
     } else if ([call.method isEqualToString:@"identify"]) {
         NSString* userId = [call.arguments objectForKey:@"userId"];
