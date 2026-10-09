@@ -1,8 +1,10 @@
 #import "./include/rudder_plugin_ios/RudderSdkFlutterPlugin.h"
+#import "RSImmediateEventDispatcher.h"
 
 static NSNotification* _notification;
 static RSDBEncryption* _dbEncryption;
 static NSArray* _staticMethods;
+static RSImmediateEventDispatcher* _immediateEventDispatcher;
 
 
 @implementation RudderSdkFlutterPlugin
@@ -47,9 +49,17 @@ BOOL isRegistrarDetached = NO;
         [RSLogger logError:@"RudderClient is not initialized. Please initialize the SDK before calling any methods."];
     }
     if ([call.method isEqualToString:@"initializeSDK"]) {
+        RSConfig* config = [self getRudderConfigObject:[call.arguments objectForKey:@"config"]];
         [RSClient getInstance:[call.arguments objectForKey:@"writeKey"]
-                       config:[self getRudderConfigObject:[call.arguments objectForKey:@"config"]]
+                       config:config
                       options:[self getRudderOptionsObject:[call.arguments objectForKey:@"options"]]];
+        if (config.dataPlaneUrl != nil) {
+            _immediateEventDispatcher = [[RSImmediateEventDispatcher alloc]
+                                         initWithWriteKey:[call.arguments objectForKey:@"writeKey"]
+                                         dataPlaneUrl:config.dataPlaneUrl];
+            [_immediateEventDispatcher warmUp];
+            [_immediateEventDispatcher requeuePending];
+        }
         if (_notification != nil) {
             [[RSClient sharedInstance] trackLifecycleEvents:_notification.userInfo];
         }
@@ -80,7 +90,11 @@ BOOL isRegistrarDetached = NO;
         if ([call.arguments objectForKey:@"options"]) {
             options = [self getRudderOptionsObject:[call.arguments objectForKey:@"options"]];
         }
-        [[RSClient sharedInstance] track:eventName properties:eventProperties options:options];
+        if (_immediateEventDispatcher != nil && [RSImmediateEventDispatcher isImmediate:eventProperties]) {
+            [_immediateEventDispatcher track:eventName properties:eventProperties options:options];
+        } else {
+            [[RSClient sharedInstance] track:eventName properties:eventProperties options:options];
+        }
         return;
 
     } else if ([call.method isEqualToString:@"screen"]) {

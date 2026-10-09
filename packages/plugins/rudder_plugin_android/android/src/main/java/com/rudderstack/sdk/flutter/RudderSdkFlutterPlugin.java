@@ -56,6 +56,7 @@ public class RudderSdkFlutterPlugin implements FlutterPlugin, MethodCallHandler 
   private PreferenceManager preferenceManager;
   private ActivityLifeCycleManager activityLifeCycleManager;
   private static List<RudderIntegration.Factory> integrationList;
+  private static ImmediateEventDispatcher immediateEventDispatcher;
 
   private List<String> staticMethods = new ArrayList<String>(Arrays.asList("initializeSDK", "putDeviceToken", "putAdvertisingId", "putAnonymousId"));
   /// The MethodChannel that will the communication between Flutter and native Android
@@ -181,6 +182,9 @@ public class RudderSdkFlutterPlugin implements FlutterPlugin, MethodCallHandler 
       options = getRudderOptionsObject((Map<String, Object>) argumentsMap.get(OPTIONS));
     }
     RudderClient.getInstance(context, writeKey, config, options);
+    immediateEventDispatcher = new ImmediateEventDispatcher(context, writeKey, config.getDataPlaneUrl());
+    immediateEventDispatcher.warmUp();
+    immediateEventDispatcher.requeuePending();
   }
 
   private void initializeBridgeSDK(MethodCall call) {
@@ -234,14 +238,19 @@ public class RudderSdkFlutterPlugin implements FlutterPlugin, MethodCallHandler 
     String eventName = (String) argumentsMap.get("eventName");
     RudderProperty eventProperties = null;
     RudderOption options = null;
+    Map<String, Object> propertiesMap = null;
     if (argumentsMap.containsKey(PROPERTIES)) {
-      eventProperties =
-        new RudderProperty().putValue((Map<String, Object>) (argumentsMap.get(PROPERTIES)));
+      propertiesMap = (Map<String, Object>) argumentsMap.get(PROPERTIES);
+      eventProperties = new RudderProperty().putValue(propertiesMap);
     }
     if (argumentsMap.containsKey(OPTIONS)) {
       options = getRudderOptionsObject((Map<String, Object>) argumentsMap.get(OPTIONS));
     }
-    RudderClient.getInstance().track(eventName, eventProperties, options);
+    if (immediateEventDispatcher != null && ImmediateEventDispatcher.isImmediate(propertiesMap)) {
+      immediateEventDispatcher.track(eventName, propertiesMap, options);
+    } else {
+      RudderClient.getInstance().track(eventName, eventProperties, options);
+    }
     if(userSessionManager != null) userSessionManager.updateLastEventTimestamp();
   }
 
