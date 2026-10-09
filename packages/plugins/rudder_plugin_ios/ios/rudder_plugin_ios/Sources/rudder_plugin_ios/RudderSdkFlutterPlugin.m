@@ -122,7 +122,13 @@ BOOL isRegistrarDetached = NO;
         if ([call.arguments objectForKey:@"options"]) {
             options = [self getRudderOptionsObject:[call.arguments objectForKey:@"options"]];
         }
-        [[RSClient sharedInstance] alias:[call.arguments objectForKey:@"newId"] options:options];
+        if ([call.arguments objectForKey:@"previousId"]) {
+            [[RSClient sharedInstance] alias:[call.arguments objectForKey:@"newId"]
+                                  previousId:[call.arguments objectForKey:@"previousId"]
+                                     options:options];
+        } else {
+            [[RSClient sharedInstance] alias:[call.arguments objectForKey:@"newId"] options:options];
+        }
         return;
     } else if ([call.method isEqualToString:@"reset"]) {
         if ([call.arguments objectForKey:@"clearAnonymousId"]) {
@@ -318,7 +324,11 @@ BOOL isRegistrarDetached = NO;
     if (integrationList == nil) {
         integrationList = [[NSMutableArray alloc] init];
     }
-    [integrationList addObject:integration];
+    // Each engine (and Dart hot restart) re-registers the same singleton
+    // factories; skip duplicates to avoid re-initializing destination SDKs
+    if (![integrationList containsObject:integration]) {
+        [integrationList addObject:integration];
+    }
 }
 
 @end
