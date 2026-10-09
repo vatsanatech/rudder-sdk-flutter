@@ -1,0 +1,174 @@
+#import "RSImmediateEventDispatcher.h"
+
+static NSString *const kSendImmediately = @"sendImmediately";
+static NSString *const kPendingSuite = @"rl_immediate_pending";
+static NSString *const kPendingKey = @"messages";
+static const NSTimeInterval kRequestTimeout = 5;
+
+@implementation RSImmediateEventDispatcher {
+    dispatch_queue_t _queue;
+    NSURLSession *_session;
+    NSUserDefaults *_pending;
+    NSString *_authorization;
+    NSURL *_batchUrl;
+    NSURL *_healthUrl;
+}
+
+- (instancetype)initWithWriteKey:(NSString *)writeKey dataPlaneUrl:(NSString *)dataPlaneUrl {
+    self = [super init];
+    if (self) {
+        _queue = dispatch_queue_create("com.rudderstack.flutter.immediate", DISPATCH_QUEUE_SERIAL);
+        NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration defaultSessionConfiguration];
+        configuration.timeoutIntervalForRequest = kRequestTimeout;
+        configuration.timeoutIntervalForResource = kRequestTimeout * 2;
+        _session = [NSURLSession sessionWithConfiguration:configuration];
+        _pending = [[NSUserDefaults alloc] initWithSuiteName:kPendingSuite];
+        NSData *credentials = [[NSString stringWithFormat:@"%@:", writeKey] dataUsingEncoding:NSUTF8StringEncoding];
+        _authorization = [NSString stringWithFormat:@"Basic %@", [credentials base64EncodedStringWithOptions:0]];
+        NSString *base = [dataPlaneUrl hasSuffix:@"/"] ? dataPlaneUrl : [dataPlaneUrl stringByAppendingString:@"/"];
+        _batchUrl = [NSURL URLWithString:[base stringByAppendingString:@"v1/batch"]];
+        _healthUrl = [NSURL URLWithString:[base stringByAppendingString:@"health"]];
+    }
+    return self;
+}
+
++ (BOOL)isImmediate:(NSDictionary *)properties {
+    id flag = properties[kSendImmediately];
+    return [flag isKindOfClass:[NSNumber class]] && [flag boolValue];
+}
+
+- (void)warmUp {
+    if (_healthUrl == nil) return;
+    [[_session dataTaskWithURL:_healthUrl completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (error != nil) [RSLogger logDebug:[NSString stringWithFormat:@"RSImmediateEventDispatcher: warm-up failed: %@", error]];
+    }] resume];
+}
+
+- (void)track:(NSString *)eventName properties:(NSDictionary *)properties options:(RSOption *)options {
+    RSMessageBuilder *builder = [[[RSMessageBuilder alloc] init] setEventName:eventName];
+    [builder setPropertyDict:properties];
+    if (options != nil) [builder setRSOption:options];
+    RSMessage *message = [builder build];
+    message.type = @"track";
+    NSString *messageId = message.messageId;
+    NSMutableDictionary *event = [self eventFromMessage:message];
+    NSData *eventData = event == nil ? nil : [NSJSONSerialization dataWithJSONObject:event options:0 error:nil];
+    if (messageId == nil || eventData == nil || _batchUrl == nil || [[RSPreferenceManager getInstance] getOptStatus]) {
+        // Opted out (the SDK drops it) or not serializable: the SDK path decides.
+        [self queue:message];
+        return;
+    }
+    // Stored before anything else, so a process killed while the event waits or is in flight loses nothing.
+    [self storePending:eventData messageId:messageId];
+    NSDate *trackedAt = [NSDate date];
+    dispatch_async(_queue, ^{
+        [self deliver:event completion:^(BOOL delivered) {
+            if (delivered) {
+                [RSLogger logDebug:[NSString stringWithFormat:@"RSImmediateEventDispatcher: %@ delivered in %.0f ms",
+                                    message.event, -[trackedAt timeIntervalSinceNow] * 1000]];
+            } else {
+                [self queue:message];
+            }
+            [self removePending:messageId];
+        }];
+    });
+}
+
+- (void)sendPending {
+    NSDictionary *stored = [self pendingSnapshot];
+    if (stored.count == 0) return;
+    dispatch_async(_queue, ^{
+        for (NSString *messageId in stored) {
+            id data = stored[messageId];
+            id event = [data isKindOfClass:[NSData class]]
+                ? [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil] : nil;
+            if (![event isKindOfClass:[NSMutableDictionary class]]) {
+                [self removePending:messageId];
+                continue;
+            }
+            // Sent as stored (same session and context); one that still fails goes to the SDK queue.
+            [self deliver:event completion:^(BOOL delivered) {
+                if (!delivered) [self queue:[[RSMessage alloc] initWithDict:event]];
+                [self removePending:messageId];
+            }];
+        }
+    });
+}
+
+#pragma mark - Private
+
+// The message as the SDK would upload it, with the fields the SDK adds while processing a queued message.
+- (NSMutableDictionary *)eventFromMessage:(RSMessage *)message {
+    NSMutableDictionary *event = [[message dict] mutableCopy];
+    event[@"type"] = @"track";
+    NSDictionary *integrations = event[@"integrations"];
+    if (![integrations isKindOfClass:[NSDictionary class]] || integrations.count == 0) event[@"integrations"] = @{@"All": @YES};
+    NSNumber *sessionId = [RSClient sharedInstance].sessionId;
+    if (sessionId != nil && [event[@"context"] isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *context = [event[@"context"] mutableCopy];
+        context[@"sessionId"] = sessionId;
+        event[@"context"] = context;
+    }
+    return [NSJSONSerialization isValidJSONObject:event] ? event : nil;
+}
+
+- (void)deliver:(NSMutableDictionary *)event completion:(void (^)(BOOL delivered))completion {
+    NSString *sentAt = [RSUtils getTimestamp];
+    event[@"sentAt"] = sentAt;
+    NSData *body = [NSJSONSerialization dataWithJSONObject:@{@"sentAt": sentAt, @"batch": @[event]} options:0 error:nil];
+    if (body == nil || _batchUrl == nil) {
+        completion(NO);
+        return;
+    }
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:_batchUrl];
+    request.HTTPMethod = @"POST";
+    request.HTTPBody = body;
+    [request setValue:@"application/json; charset=utf-8" forHTTPHeaderField:@"Content-Type"];
+    [request setValue:_authorization forHTTPHeaderField:@"Authorization"];
+    [[_session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)response).statusCode : 0;
+        BOOL delivered = error == nil && status >= 200 && status < 300;
+        if (!delivered) {
+            [RSLogger logWarn:[NSString stringWithFormat:@"RSImmediateEventDispatcher: %@ queued (status %ld, %@)",
+                               event[@"event"], (long)status, error.localizedDescription]];
+        }
+        dispatch_async(self->_queue, ^{
+            completion(delivered);
+        });
+    }] resume];
+}
+
+- (void)queue:(RSMessage *)message {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    // The only SDK entry point that keeps the message ID, so a retry after a lost response is deduplicated.
+    [[RSClient sharedInstance] trackMessage:message];
+#pragma clang diagnostic pop
+}
+
+// The pending store holds each event as JSON data: NSUserDefaults only takes property-list values, which NSNull
+// (a null property) is not.
+- (void)storePending:(NSData *)eventData messageId:(NSString *)messageId {
+    @synchronized (self) {
+        NSMutableDictionary *stored = [[_pending dictionaryForKey:kPendingKey] mutableCopy] ?: [NSMutableDictionary dictionary];
+        stored[messageId] = eventData;
+        [_pending setObject:stored forKey:kPendingKey];
+    }
+}
+
+- (void)removePending:(NSString *)messageId {
+    @synchronized (self) {
+        NSMutableDictionary *stored = [[_pending dictionaryForKey:kPendingKey] mutableCopy];
+        if (stored[messageId] == nil) return;
+        [stored removeObjectForKey:messageId];
+        [_pending setObject:stored forKey:kPendingKey];
+    }
+}
+
+- (NSDictionary *)pendingSnapshot {
+    @synchronized (self) {
+        return [_pending dictionaryForKey:kPendingKey] ?: @{};
+    }
+}
+
+@end

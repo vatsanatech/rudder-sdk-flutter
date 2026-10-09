@@ -1,8 +1,10 @@
 #import "./include/rudder_plugin_ios/RudderSdkFlutterPlugin.h"
+#import "RSImmediateEventDispatcher.h"
 
 static NSNotification* _notification;
 static RSDBEncryption* _dbEncryption;
 static NSArray* _staticMethods;
+static RSImmediateEventDispatcher* _immediateEventDispatcher;
 
 
 @implementation RudderSdkFlutterPlugin
@@ -47,12 +49,19 @@ BOOL isRegistrarDetached = NO;
         [RSLogger logError:@"RudderClient is not initialized. Please initialize the SDK before calling any methods."];
     }
     if ([call.method isEqualToString:@"initializeSDK"]) {
+        RSConfig* config = [self getRudderConfigObject:[call.arguments objectForKey:@"config"]];
         [RSClient getInstance:[call.arguments objectForKey:@"writeKey"]
-                       config:[self getRudderConfigObject:[call.arguments objectForKey:@"config"]]
+                       config:config
                       options:[self getRudderOptionsObject:[call.arguments objectForKey:@"options"]]];
-        if (_notification != nil) {
-            [[RSClient sharedInstance] trackLifecycleEvents:_notification.userInfo];
+        // Once per process: a second initialization (hot restart, another engine) keeps the first dispatcher.
+        if (_immediateEventDispatcher == nil && config.dataPlaneUrl != nil) {
+            _immediateEventDispatcher = [[RSImmediateEventDispatcher alloc]
+                                         initWithWriteKey:[call.arguments objectForKey:@"writeKey"]
+                                         dataPlaneUrl:config.dataPlaneUrl];
+            [_immediateEventDispatcher warmUp];
+            [_immediateEventDispatcher sendPending];
         }
+        [[RSClient sharedInstance] trackLifecycleEvents:_notification.userInfo];
         return;
     } else if ([call.method isEqualToString:@"identify"]) {
         NSString* userId = [call.arguments objectForKey:@"userId"];
@@ -80,7 +89,11 @@ BOOL isRegistrarDetached = NO;
         if ([call.arguments objectForKey:@"options"]) {
             options = [self getRudderOptionsObject:[call.arguments objectForKey:@"options"]];
         }
-        [[RSClient sharedInstance] track:eventName properties:eventProperties options:options];
+        if (_immediateEventDispatcher != nil && [RSImmediateEventDispatcher isImmediate:eventProperties]) {
+            [_immediateEventDispatcher track:eventName properties:eventProperties options:options];
+        } else {
+            [[RSClient sharedInstance] track:eventName properties:eventProperties options:options];
+        }
         return;
 
     } else if ([call.method isEqualToString:@"screen"]) {
@@ -122,7 +135,13 @@ BOOL isRegistrarDetached = NO;
         if ([call.arguments objectForKey:@"options"]) {
             options = [self getRudderOptionsObject:[call.arguments objectForKey:@"options"]];
         }
-        [[RSClient sharedInstance] alias:[call.arguments objectForKey:@"newId"] options:options];
+        if ([call.arguments objectForKey:@"previousId"]) {
+            [[RSClient sharedInstance] alias:[call.arguments objectForKey:@"newId"]
+                                  previousId:[call.arguments objectForKey:@"previousId"]
+                                     options:options];
+        } else {
+            [[RSClient sharedInstance] alias:[call.arguments objectForKey:@"newId"] options:options];
+        }
         return;
     } else if ([call.method isEqualToString:@"reset"]) {
         if ([call.arguments objectForKey:@"clearAnonymousId"]) {
@@ -318,7 +337,11 @@ BOOL isRegistrarDetached = NO;
     if (integrationList == nil) {
         integrationList = [[NSMutableArray alloc] init];
     }
-    [integrationList addObject:integration];
+    // Each engine (and Dart hot restart) re-registers the same singleton
+    // factories; skip duplicates to avoid re-initializing destination SDKs
+    if (![integrationList containsObject:integration]) {
+        [integrationList addObject:integration];
+    }
 }
 
 @end
