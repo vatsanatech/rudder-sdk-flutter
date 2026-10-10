@@ -56,6 +56,22 @@ final class ImmediateEventDispatcher {
   private final String batchUrl;
   private final String healthUrl;
 
+  private static ImmediateEventDispatcher shared;
+
+  /**
+   * The process's dispatcher, created once by whichever starts first: the plugin's initialization from Dart, or an
+   * event sent before the Flutter engine starts ({@link EarlyEvents}). Creating it warms the connection and sends
+   * what a killed process left pending.
+   */
+  static synchronized ImmediateEventDispatcher shared(Context context, String writeKey, String dataPlaneUrl) {
+    if (shared == null) {
+      shared = new ImmediateEventDispatcher(context.getApplicationContext(), writeKey, dataPlaneUrl);
+      shared.warmUp();
+      shared.sendPending();
+    }
+    return shared;
+  }
+
   ImmediateEventDispatcher(Context context, String writeKey, String dataPlaneUrl) {
     this.pending = context.getSharedPreferences(PENDING_PREFS, Context.MODE_PRIVATE);
     this.rudderPrefs = context.getSharedPreferences(RUDDER_PREFS, Context.MODE_PRIVATE);
