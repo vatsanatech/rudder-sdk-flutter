@@ -47,9 +47,8 @@ final class ImmediateEventDispatcher {
   private static final int CONNECT_TIMEOUT_MS = 3000;
   private static final int READ_TIMEOUT_MS = 5000;
 
-  // Sends run one at a time so the keep-alive connection is reused; the warm-up never delays them.
+  // Sends run one at a time so the keep-alive connection is reused; the warm-up (its own thread) never delays them.
   private final ExecutorService sender = Executors.newSingleThreadExecutor();
-  private final ExecutorService warmer = Executors.newSingleThreadExecutor();
   private final SharedPreferences pending;
   private final SharedPreferences rudderPrefs;
   private final String authorization;
@@ -57,6 +56,7 @@ final class ImmediateEventDispatcher {
   private final String healthUrl;
 
   private static ImmediateEventDispatcher shared;
+  private static final java.util.concurrent.atomic.AtomicBoolean warmed = new java.util.concurrent.atomic.AtomicBoolean();
 
   /**
    * The process's dispatcher, created once by whichever starts first: the plugin's initialization from Dart, or an
@@ -91,7 +91,17 @@ final class ImmediateEventDispatcher {
    * pay for DNS, TCP and TLS. The kept-alive connection is reused by the next request.
    */
   void warmUp() {
-    warmer.execute(new Runnable() {
+    warmUp(healthUrl);
+  }
+
+  /**
+   * Opens the connection to the data plane once per process, before anything else needs it: an event sent before the
+   * Flutter engine starts then reuses it instead of paying for DNS, TCP and TLS itself.
+   */
+  static void warmUp(String dataPlaneUrl) {
+    if (dataPlaneUrl == null || !warmed.compareAndSet(false, true)) return;
+    final String healthUrl = (dataPlaneUrl.endsWith("/") ? dataPlaneUrl : dataPlaneUrl + "/") + "health";
+    new Thread(new Runnable() {
       @Override
       public void run() {
         try {
@@ -103,7 +113,7 @@ final class ImmediateEventDispatcher {
           RudderLogger.logDebug("ImmediateEventDispatcher: warm-up failed: " + e);
         }
       }
-    });
+    }, "rl-warm-up").start();
   }
 
   void track(String eventName, Map<String, Object> properties, RudderOption options) {

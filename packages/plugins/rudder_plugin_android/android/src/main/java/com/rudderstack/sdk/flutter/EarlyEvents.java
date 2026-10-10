@@ -48,6 +48,39 @@ public final class EarlyEvents {
     editor.apply();
   }
 
+  /**
+   * Creates the client and the dispatcher, warming its connection, in the background; an event sent next (from the
+   * launcher activity) then waits for neither. Call it from {@code Application.onCreate}: it sends nothing, so a process
+   * started in the background costs one connection to the data plane.
+   */
+  public static void prepare(Context context) {
+    final Context app = context.getApplicationContext();
+    SharedPreferences prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+    final String writeKey = prefs.getString(KEY_WRITE_KEY, null);
+    final String configJson = prefs.getString(KEY_CONFIG, null);
+    if (writeKey == null || configJson == null) return;
+    executor.execute(new Runnable() {
+      @Override
+      public void run() {
+        try {
+          ready(app, writeKey, new JSONObject(configJson));
+        } catch (Exception e) {
+          RudderLogger.logError(e);
+        }
+      }
+    });
+  }
+
+  private static ImmediateEventDispatcher ready(Context app, String writeKey, JSONObject configJson) throws Exception {
+    RudderConfig config = getRudderConfigObject(toMap(configJson), null, null);
+    // First, so the connection is ready by the time the event is sent; creating the client takes a few hundred ms.
+    ImmediateEventDispatcher.warmUp(config.getDataPlaneUrl());
+    synchronized (LOCK) {
+      if (RudderClient.getInstance() == null) RudderClient.getInstance(app, writeKey, config);
+    }
+    return ImmediateEventDispatcher.shared(app, writeKey, config.getDataPlaneUrl());
+  }
+
   /** Sends {@code eventName} as an immediate event; false when there is no saved configuration to send it with. */
   public static boolean trackImmediate(Context context, final String eventName, Map<String, Object> properties) {
     final Context app = context.getApplicationContext();
@@ -61,11 +94,8 @@ public final class EarlyEvents {
       @Override
       public void run() {
         try {
-          RudderConfig config = getRudderConfigObject(toMap(new JSONObject(configJson)), null, null);
-          synchronized (LOCK) {
-            if (RudderClient.getInstance() == null) RudderClient.getInstance(app, writeKey, config);
-          }
-          ImmediateEventDispatcher.shared(app, writeKey, config.getDataPlaneUrl()).track(eventName, eventProperties, null);
+          ImmediateEventDispatcher dispatcher = ready(app, writeKey, new JSONObject(configJson));
+          dispatcher.track(eventName, eventProperties, null);
         } catch (Exception e) {
           RudderLogger.logError(e);
         }
