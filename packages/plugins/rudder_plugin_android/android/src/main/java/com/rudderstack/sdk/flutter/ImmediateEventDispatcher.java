@@ -2,6 +2,8 @@ package com.rudderstack.sdk.flutter;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.net.SSLCertificateSocketFactory;
+import android.net.SSLSessionCache;
 import android.os.SystemClock;
 import android.util.Base64;
 
@@ -28,6 +30,9 @@ import java.util.TimeZone;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLSocketFactory;
+
 /**
  * Sends a track event whose properties carry {@code sendImmediately: true} straight to the data plane as a one-event
  * batch, instead of writing it to the SDK's database and waiting for the next flush.
@@ -50,6 +55,7 @@ final class ImmediateEventDispatcher {
   // Sends run one at a time so the keep-alive connection is reused; the warm-up (its own thread) never delays them.
   private final ExecutorService sender = Executors.newSingleThreadExecutor();
   private final SharedPreferences pending;
+  private final SSLSocketFactory sessionCachingFactory;
   private final SharedPreferences rudderPrefs;
   private final String authorization;
   private final String batchUrl;
@@ -101,6 +107,7 @@ final class ImmediateEventDispatcher {
 
   ImmediateEventDispatcher(Context context, String writeKey, String dataPlaneUrl) {
     this.pending = context.getSharedPreferences(PENDING_PREFS, Context.MODE_PRIVATE);
+    this.sessionCachingFactory = sessionCachingFactory(context);
     this.rudderPrefs = context.getSharedPreferences(RUDDER_PREFS, Context.MODE_PRIVATE);
     this.authorization = "Basic " + Base64.encodeToString((writeKey + ":").getBytes(StandardCharsets.UTF_8),
         Base64.NO_WRAP);
@@ -239,6 +246,9 @@ final class ImmediateEventDispatcher {
 
   private boolean post(String body) throws Exception {
     HttpURLConnection connection = (HttpURLConnection) new URL(batchUrl).openConnection();
+    if (sessionCachingFactory != null && connection instanceof HttpsURLConnection) {
+      ((HttpsURLConnection) connection).setSSLSocketFactory(sessionCachingFactory);
+    }
     try {
       connection.setRequestMethod("POST");
       connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
@@ -274,6 +284,17 @@ final class ImmediateEventDispatcher {
       in.close();
     } catch (Exception e) {
       connection.disconnect();
+    }
+  }
+
+  // TLS sessions kept on disk: a new process resumes the last session with the data plane, a round trip and a
+  // certificate verification shorter than a full handshake. Null where it cannot be set up.
+  @SuppressWarnings("deprecation")
+  private static SSLSocketFactory sessionCachingFactory(Context context) {
+    try {
+      return SSLCertificateSocketFactory.getDefault(CONNECT_TIMEOUT_MS, new SSLSessionCache(context));
+    } catch (Exception e) {
+      return null;
     }
   }
 
