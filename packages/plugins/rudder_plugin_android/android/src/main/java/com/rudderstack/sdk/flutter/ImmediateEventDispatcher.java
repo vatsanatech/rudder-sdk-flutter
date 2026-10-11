@@ -55,13 +55,15 @@ final class ImmediateEventDispatcher {
   // Sends run one at a time so the keep-alive connection is reused; the warm-up (its own thread) never delays them.
   private final ExecutorService sender = Executors.newSingleThreadExecutor();
   private final SharedPreferences pending;
-  private final SSLSocketFactory sessionCachingFactory;
   private final SharedPreferences rudderPrefs;
   private final String authorization;
   private final String batchUrl;
-  private final String healthUrl;
+  private final String dataPlaneUrl;
 
   private static ImmediateEventDispatcher shared;
+  // One per process: connections are pooled per socket factory, so the warm-up and the sends must share it to share
+  // the kept-alive connection.
+  private static volatile SSLSocketFactory socketFactory;
   private static final java.util.concurrent.atomic.AtomicBoolean warmed = new java.util.concurrent.atomic.AtomicBoolean();
 
   /**
@@ -107,13 +109,13 @@ final class ImmediateEventDispatcher {
 
   ImmediateEventDispatcher(Context context, String writeKey, String dataPlaneUrl) {
     this.pending = context.getSharedPreferences(PENDING_PREFS, Context.MODE_PRIVATE);
-    this.sessionCachingFactory = sessionCachingFactory(context);
+    initSocketFactory(context);
     this.rudderPrefs = context.getSharedPreferences(RUDDER_PREFS, Context.MODE_PRIVATE);
     this.authorization = "Basic " + Base64.encodeToString((writeKey + ":").getBytes(StandardCharsets.UTF_8),
         Base64.NO_WRAP);
     String base = dataPlaneUrl.endsWith("/") ? dataPlaneUrl : dataPlaneUrl + "/";
     this.batchUrl = base + "v1/batch";
-    this.healthUrl = base + "health";
+    this.dataPlaneUrl = dataPlaneUrl;
   }
 
   static boolean isImmediate(Map<String, Object> properties) {
@@ -125,21 +127,23 @@ final class ImmediateEventDispatcher {
    * pay for DNS, TCP and TLS. The kept-alive connection is reused by the next request.
    */
   void warmUp() {
-    warmUp(healthUrl);
+    warmUp(null, dataPlaneUrl);
   }
 
   /**
    * Opens the connection to the data plane once per process, before anything else needs it: an event sent before the
    * Flutter engine starts then reuses it instead of paying for DNS, TCP and TLS itself.
    */
-  static void warmUp(String dataPlaneUrl) {
+  static void warmUp(Context context, String dataPlaneUrl) {
     if (dataPlaneUrl == null || !warmed.compareAndSet(false, true)) return;
+    if (context != null) initSocketFactory(context);
     final String healthUrl = (dataPlaneUrl.endsWith("/") ? dataPlaneUrl : dataPlaneUrl + "/") + "health";
     new Thread(new Runnable() {
       @Override
       public void run() {
         try {
           HttpURLConnection connection = (HttpURLConnection) new URL(healthUrl).openConnection();
+          useSocketFactory(connection);
           connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
           connection.setReadTimeout(READ_TIMEOUT_MS);
           drain(connection);
@@ -246,9 +250,7 @@ final class ImmediateEventDispatcher {
 
   private boolean post(String body) throws Exception {
     HttpURLConnection connection = (HttpURLConnection) new URL(batchUrl).openConnection();
-    if (sessionCachingFactory != null && connection instanceof HttpsURLConnection) {
-      ((HttpsURLConnection) connection).setSSLSocketFactory(sessionCachingFactory);
-    }
+    useSocketFactory(connection);
     try {
       connection.setRequestMethod("POST");
       connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
@@ -288,13 +290,21 @@ final class ImmediateEventDispatcher {
   }
 
   // TLS sessions kept on disk: a new process resumes the last session with the data plane, a round trip and a
-  // certificate verification shorter than a full handshake. Null where it cannot be set up.
+  // certificate verification shorter than a full handshake. Left unset (the default factory) where it cannot be set up.
   @SuppressWarnings("deprecation")
-  private static SSLSocketFactory sessionCachingFactory(Context context) {
+  private static synchronized void initSocketFactory(Context context) {
+    if (socketFactory != null) return;
     try {
-      return SSLCertificateSocketFactory.getDefault(CONNECT_TIMEOUT_MS, new SSLSessionCache(context));
+      socketFactory = SSLCertificateSocketFactory.getDefault(CONNECT_TIMEOUT_MS, new SSLSessionCache(context));
     } catch (Exception e) {
-      return null;
+      RudderLogger.logDebug("ImmediateEventDispatcher: no TLS session cache: " + e);
+    }
+  }
+
+  private static void useSocketFactory(HttpURLConnection connection) {
+    SSLSocketFactory factory = socketFactory;
+    if (factory != null && connection instanceof HttpsURLConnection) {
+      ((HttpsURLConnection) connection).setSSLSocketFactory(factory);
     }
   }
 

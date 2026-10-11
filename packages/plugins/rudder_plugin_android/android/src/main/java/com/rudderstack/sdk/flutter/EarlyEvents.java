@@ -47,6 +47,11 @@ public final class EarlyEvents {
   private static final String KEY_TRAITS = "rl_traits";
   private static final String KEY_OPT_OUT = "rl_opt_status";
   private static final String KEY_SESSION_ID = "rl_session_id_key";
+  // The plugin's session store (managers.PreferenceManager): when the last event went out, against the session timeout.
+  private static final String FLUTTER_RUDDER_PREFS = "rl_prefs_flutter";
+  private static final String KEY_LAST_EVENT_AT = "rl_last_event_timestamp";
+  private static final String KEY_SESSION_TIMEOUT = "sessionTimeoutInMillis";
+  private static final long DEFAULT_SESSION_TIMEOUT_MS = 300000L;
   private static final String LIBRARY = "com.rudderstack.android.sdk.core";
   // Off the main thread, so creating the client never delays the first frame.
   private static final ExecutorService executor = Executors.newSingleThreadExecutor();
@@ -89,7 +94,7 @@ public final class EarlyEvents {
   private static ImmediateEventDispatcher ready(Context app, String writeKey, JSONObject configJson) throws Exception {
     RudderConfig config = getRudderConfigObject(toMap(configJson), null, null);
     // First, so the connection is ready by the time the event is sent; creating the client takes a few hundred ms.
-    ImmediateEventDispatcher.warmUp(config.getDataPlaneUrl());
+    ImmediateEventDispatcher.warmUp(app, config.getDataPlaneUrl());
     synchronized (LOCK) {
       if (RudderClient.getInstance() == null) RudderClient.getInstance(app, writeKey, config);
     }
@@ -113,10 +118,12 @@ public final class EarlyEvents {
       if (writeKey == null || configJson == null || anonymousId == null || rudder.getBoolean(KEY_OPT_OUT, false)) {
         return false;
       }
-      String dataPlaneUrl = new JSONObject(configJson).optString("dataPlaneUrl", null);
+      JSONObject config = new JSONObject(configJson);
+      String dataPlaneUrl = config.optString("dataPlaneUrl", null);
       if (dataPlaneUrl == null || dataPlaneUrl.isEmpty()) return false;
       String messageId = UUID.randomUUID().toString();
-      JsonObject event = buildEvent(app, rudder, anonymousId, messageId, eventName, properties);
+      long sessionId = isSessionActive(app, config) ? rudder.getLong(KEY_SESSION_ID, 0) : 0;
+      JsonObject event = buildEvent(app, rudder, anonymousId, sessionId, messageId, eventName, properties);
       ImmediateEventDispatcher.sendFirst(app, writeKey, dataPlaneUrl, event, messageId);
       return true;
     } catch (Exception e) {
@@ -125,8 +132,16 @@ public final class EarlyEvents {
     }
   }
 
-  private static JsonObject buildEvent(Context app, SharedPreferences rudder, String anonymousId, String messageId,
-      String eventName, Map<String, Object> properties) throws Exception {
+  // As the plugin's UserSessionManager decides at initialization: past the timeout since the last event, the session
+  // it resumes is replaced by a new one, which does not exist yet; the event then goes without a session.
+  private static boolean isSessionActive(Context app, JSONObject config) {
+    long lastEventAt = app.getSharedPreferences(FLUTTER_RUDDER_PREFS, Context.MODE_PRIVATE).getLong(KEY_LAST_EVENT_AT, -1);
+    long timeout = config.optLong(KEY_SESSION_TIMEOUT, DEFAULT_SESSION_TIMEOUT_MS);
+    return lastEventAt > 0 && Math.abs(System.currentTimeMillis() - lastEventAt) < timeout;
+  }
+
+  private static JsonObject buildEvent(Context app, SharedPreferences rudder, String anonymousId, long sessionId,
+      String messageId, String eventName, Map<String, Object> properties) throws Exception {
     JsonObject traits = new JsonObject();
     String savedTraits = rudder.getString(KEY_TRAITS, null);
     if (savedTraits != null) traits = JsonParser.parseString(savedTraits).getAsJsonObject();
@@ -158,7 +173,6 @@ public final class EarlyEvents {
     eventContext.add("traits", traits);
     eventContext.addProperty("locale", Locale.getDefault().toLanguageTag());
     eventContext.addProperty("timezone", TimeZone.getDefault().getID());
-    long sessionId = rudder.getLong(KEY_SESSION_ID, 0);
     if (sessionId > 0) eventContext.addProperty("sessionId", sessionId);
 
     JsonObject eventProperties = new JsonObject();
