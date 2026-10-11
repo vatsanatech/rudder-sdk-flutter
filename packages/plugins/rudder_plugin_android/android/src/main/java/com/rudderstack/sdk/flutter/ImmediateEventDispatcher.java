@@ -80,7 +80,9 @@ final class ImmediateEventDispatcher {
       String messageId) {
     warmed.set(true);
     boolean created = shared == null;
-    if (created) shared = new ImmediateEventDispatcher(context.getApplicationContext(), writeKey, dataPlaneUrl);
+    // From Application.attachBaseContext there is no application context yet; the base context serves the same files.
+    Context appContext = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+    if (created) shared = new ImmediateEventDispatcher(appContext, writeKey, dataPlaneUrl);
     shared.sendStored(event, messageId);
     if (created) shared.sendPending(messageId);
   }
