@@ -5,6 +5,20 @@ static NSNotification* _notification;
 static RSDBEncryption* _dbEncryption;
 static NSArray* _staticMethods;
 static RSImmediateEventDispatcher* _immediateEventDispatcher;
+static NSString* const kEarlyEventsSuite = @"rl_flutter_init";
+
+// The process's dispatcher, created once by whichever starts first: the plugin's initialization from Dart, or an event
+// sent before the Flutter engine starts. Creating it warms the connection and sends what a killed process left pending.
+static RSImmediateEventDispatcher* sharedDispatcher(NSString* writeKey, NSString* dataPlaneUrl) {
+    @synchronized ([RudderSdkFlutterPlugin class]) {
+        if (_immediateEventDispatcher == nil && writeKey != nil && dataPlaneUrl != nil) {
+            _immediateEventDispatcher = [[RSImmediateEventDispatcher alloc] initWithWriteKey:writeKey dataPlaneUrl:dataPlaneUrl];
+            [_immediateEventDispatcher warmUp];
+            [_immediateEventDispatcher sendPending];
+        }
+        return _immediateEventDispatcher;
+    }
+}
 
 
 @implementation RudderSdkFlutterPlugin
@@ -36,6 +50,36 @@ BOOL isRegistrarDetached = NO;
     _dbEncryption = dbEncryption;
 }
 
+// The configuration is kept as JSON data: NSUserDefaults takes only property-list values, and it may hold NSNull.
++ (void)saveEarlyEventsWriteKey:(NSString*)writeKey config:(NSDictionary*)configDict {
+    NSUserDefaults* defaults = [[NSUserDefaults alloc] initWithSuiteName:kEarlyEventsSuite];
+    NSData* config = configDict != nil && [NSJSONSerialization isValidJSONObject:configDict]
+        ? [NSJSONSerialization dataWithJSONObject:configDict options:0 error:nil] : nil;
+    if (writeKey == nil || config == nil || _dbEncryption != nil || integrationList != nil) {
+        [defaults removeObjectForKey:@"writeKey"];
+        [defaults removeObjectForKey:@"config"];
+        return;
+    }
+    [defaults setObject:writeKey forKey:@"writeKey"];
+    [defaults setObject:config forKey:@"config"];
+}
+
++ (BOOL)trackEarlyEvent:(NSString*)eventName properties:(NSDictionary*)properties {
+    NSUserDefaults* defaults = [[NSUserDefaults alloc] initWithSuiteName:kEarlyEventsSuite];
+    NSString* writeKey = [defaults stringForKey:@"writeKey"];
+    NSData* configData = [defaults dataForKey:@"config"];
+    id configDict = configData == nil ? nil : [NSJSONSerialization JSONObjectWithData:configData options:0 error:nil];
+    if (writeKey == nil || ![configDict isKindOfClass:[NSDictionary class]]) return NO;
+    RSConfig* config = [[[RudderSdkFlutterPlugin alloc] init] getRudderConfigObject:configDict];
+    if ([RSClient sharedInstance] == nil) [RSClient getInstance:writeKey config:config];
+    RSImmediateEventDispatcher* dispatcher = sharedDispatcher(writeKey, config.dataPlaneUrl);
+    if (dispatcher == nil) return NO;
+    NSMutableDictionary* eventProperties = [properties mutableCopy] ?: [NSMutableDictionary dictionary];
+    eventProperties[@"sendImmediately"] = @YES;
+    [dispatcher track:eventName properties:eventProperties options:nil];
+    return YES;
+}
+
 - (void)detachFromEngineForRegistrar: (NSObject<FlutterPluginRegistrar> *)registrar {
     isRegistrarDetached = YES;
 }
@@ -49,18 +93,16 @@ BOOL isRegistrarDetached = NO;
         [RSLogger logError:@"RudderClient is not initialized. Please initialize the SDK before calling any methods."];
     }
     if ([call.method isEqualToString:@"initializeSDK"]) {
-        RSConfig* config = [self getRudderConfigObject:[call.arguments objectForKey:@"config"]];
-        [RSClient getInstance:[call.arguments objectForKey:@"writeKey"]
+        NSString* writeKey = [call.arguments objectForKey:@"writeKey"];
+        NSDictionary* configDict = [call.arguments objectForKey:@"config"];
+        RSConfig* config = [self getRudderConfigObject:configDict];
+        // An event sent before the engine started may have created the client already; this one then keeps it.
+        [RSClient getInstance:writeKey
                        config:config
                       options:[self getRudderOptionsObject:[call.arguments objectForKey:@"options"]]];
         // Once per process: a second initialization (hot restart, another engine) keeps the first dispatcher.
-        if (_immediateEventDispatcher == nil && config.dataPlaneUrl != nil) {
-            _immediateEventDispatcher = [[RSImmediateEventDispatcher alloc]
-                                         initWithWriteKey:[call.arguments objectForKey:@"writeKey"]
-                                         dataPlaneUrl:config.dataPlaneUrl];
-            [_immediateEventDispatcher warmUp];
-            [_immediateEventDispatcher sendPending];
-        }
+        sharedDispatcher(writeKey, config.dataPlaneUrl);
+        [RudderSdkFlutterPlugin saveEarlyEventsWriteKey:writeKey config:configDict];
         [[RSClient sharedInstance] trackLifecycleEvents:_notification.userInfo];
         return;
     } else if ([call.method isEqualToString:@"identify"]) {

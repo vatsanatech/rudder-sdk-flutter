@@ -181,13 +181,13 @@ public class RudderSdkFlutterPlugin implements FlutterPlugin, MethodCallHandler 
     if (argumentsMap.containsKey(OPTIONS)) {
       options = getRudderOptionsObject((Map<String, Object>) argumentsMap.get(OPTIONS));
     }
-    RudderClient.getInstance(context, writeKey, config, options);
-    // Once per process: a second initialization (hot restart, another engine) keeps the first dispatcher.
-    if (immediateEventDispatcher == null) {
-      immediateEventDispatcher = new ImmediateEventDispatcher(context, writeKey, config.getDataPlaneUrl());
-      immediateEventDispatcher.warmUp();
-      immediateEventDispatcher.sendPending();
+    // An event sent before the engine started may have created the client already; this one then keeps it.
+    synchronized (EarlyEvents.LOCK) {
+      RudderClient.getInstance(context, writeKey, config, options);
     }
+    // Once per process: a second initialization (hot restart, another engine) keeps the first dispatcher.
+    immediateEventDispatcher = ImmediateEventDispatcher.shared(context, writeKey, config.getDataPlaneUrl());
+    EarlyEvents.save(context, writeKey, configMap, dbEncryptionMap == null && integrationList == null);
   }
 
   private void initializeBridgeSDK(MethodCall call) {

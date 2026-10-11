@@ -2,6 +2,8 @@ package com.rudderstack.sdk.flutter;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.net.SSLCertificateSocketFactory;
+import android.net.SSLSessionCache;
 import android.os.SystemClock;
 import android.util.Base64;
 
@@ -28,6 +30,9 @@ import java.util.TimeZone;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLSocketFactory;
+
 /**
  * Sends a track event whose properties carry {@code sendImmediately: true} straight to the data plane as a one-event
  * batch, instead of writing it to the SDK's database and waiting for the next flush.
@@ -47,23 +52,70 @@ final class ImmediateEventDispatcher {
   private static final int CONNECT_TIMEOUT_MS = 3000;
   private static final int READ_TIMEOUT_MS = 5000;
 
-  // Sends run one at a time so the keep-alive connection is reused; the warm-up never delays them.
+  // Sends run one at a time so the keep-alive connection is reused; the warm-up (its own thread) never delays them.
   private final ExecutorService sender = Executors.newSingleThreadExecutor();
-  private final ExecutorService warmer = Executors.newSingleThreadExecutor();
   private final SharedPreferences pending;
   private final SharedPreferences rudderPrefs;
   private final String authorization;
   private final String batchUrl;
-  private final String healthUrl;
+  private final String dataPlaneUrl;
+
+  private static ImmediateEventDispatcher shared;
+  // One per process: connections are pooled per socket factory, so the warm-up and the sends must share it to share
+  // the kept-alive connection.
+  private static volatile SSLSocketFactory socketFactory;
+  private static final java.util.concurrent.atomic.AtomicBoolean warmed = new java.util.concurrent.atomic.AtomicBoolean();
+
+  /**
+   * The process's dispatcher, created once by whichever starts first: the plugin's initialization from Dart, or an
+   * event sent before the Flutter engine starts ({@link EarlyEvents}). Creating it warms the connection and sends
+   * what a killed process left pending.
+   */
+  static synchronized ImmediateEventDispatcher shared(Context context, String writeKey, String dataPlaneUrl) {
+    if (shared == null) {
+      shared = new ImmediateEventDispatcher(context.getApplicationContext(), writeKey, dataPlaneUrl);
+      shared.warmUp();
+      shared.sendPending();
+    }
+    return shared;
+  }
+
+  /**
+   * Sends an event built without the client ({@link EarlyEvents#sendFirst}) as the process's first request to the data
+   * plane: no warm-up request runs ahead of it, and messages a killed process left pending are sent after it.
+   */
+  static synchronized void sendFirst(Context context, String writeKey, String dataPlaneUrl, JsonObject event,
+      String messageId) {
+    warmed.set(true);
+    boolean created = shared == null;
+    // From Application.attachBaseContext there is no application context yet; the base context serves the same files.
+    Context appContext = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+    if (created) shared = new ImmediateEventDispatcher(appContext, writeKey, dataPlaneUrl);
+    shared.sendStored(event, messageId);
+    if (created) shared.sendPending(messageId);
+  }
+
+  // Stored pending first, so a process killed while it is in flight loses nothing; one not delivered stays pending and
+  // the next process sends it (there is no client yet to queue it with).
+  private void sendStored(final JsonObject event, final String messageId) {
+    pending.edit().putString(messageId, event.toString()).apply();
+    sender.execute(new Runnable() {
+      @Override
+      public void run() {
+        if (deliver(event)) pending.edit().remove(messageId).apply();
+      }
+    });
+  }
 
   ImmediateEventDispatcher(Context context, String writeKey, String dataPlaneUrl) {
     this.pending = context.getSharedPreferences(PENDING_PREFS, Context.MODE_PRIVATE);
+    initSocketFactory(context);
     this.rudderPrefs = context.getSharedPreferences(RUDDER_PREFS, Context.MODE_PRIVATE);
     this.authorization = "Basic " + Base64.encodeToString((writeKey + ":").getBytes(StandardCharsets.UTF_8),
         Base64.NO_WRAP);
     String base = dataPlaneUrl.endsWith("/") ? dataPlaneUrl : dataPlaneUrl + "/";
     this.batchUrl = base + "v1/batch";
-    this.healthUrl = base + "health";
+    this.dataPlaneUrl = dataPlaneUrl;
   }
 
   static boolean isImmediate(Map<String, Object> properties) {
@@ -75,11 +127,23 @@ final class ImmediateEventDispatcher {
    * pay for DNS, TCP and TLS. The kept-alive connection is reused by the next request.
    */
   void warmUp() {
-    warmer.execute(new Runnable() {
+    warmUp(null, dataPlaneUrl);
+  }
+
+  /**
+   * Opens the connection to the data plane once per process, before anything else needs it: an event sent before the
+   * Flutter engine starts then reuses it instead of paying for DNS, TCP and TLS itself.
+   */
+  static void warmUp(Context context, String dataPlaneUrl) {
+    if (dataPlaneUrl == null || !warmed.compareAndSet(false, true)) return;
+    if (context != null) initSocketFactory(context);
+    final String healthUrl = (dataPlaneUrl.endsWith("/") ? dataPlaneUrl : dataPlaneUrl + "/") + "health";
+    new Thread(new Runnable() {
       @Override
       public void run() {
         try {
           HttpURLConnection connection = (HttpURLConnection) new URL(healthUrl).openConnection();
+          useSocketFactory(connection);
           connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
           connection.setReadTimeout(READ_TIMEOUT_MS);
           drain(connection);
@@ -87,7 +151,7 @@ final class ImmediateEventDispatcher {
           RudderLogger.logDebug("ImmediateEventDispatcher: warm-up failed: " + e);
         }
       }
-    });
+    }, "rl-warm-up").start();
   }
 
   void track(String eventName, Map<String, Object> properties, RudderOption options) {
@@ -122,15 +186,22 @@ final class ImmediateEventDispatcher {
    * still fails is handed to the SDK queue.
    */
   void sendPending() {
-    final Map<String, ?> stored = pending.getAll();
+    sendPending(null);
+  }
+
+  // Except the message being sent first; one that still fails is queued, or kept pending while there is no client.
+  private void sendPending(String exceptMessageId) {
+    final Map<String, Object> stored = new java.util.HashMap<>(pending.getAll());
+    if (exceptMessageId != null) stored.remove(exceptMessageId);
     if (stored.isEmpty()) return;
     sender.execute(new Runnable() {
       @Override
       public void run() {
-        for (Map.Entry<String, ?> entry : stored.entrySet()) {
+        for (Map.Entry<String, Object> entry : stored.entrySet()) {
           try {
             JsonObject event = JsonParser.parseString(String.valueOf(entry.getValue())).getAsJsonObject();
             if (!deliver(event)) {
+              if (RudderClient.getInstance() == null) continue;
               RudderMessage message = RudderGson.deserialize(event.toString(), RudderMessage.class);
               if (message != null) RudderClient.getInstance().track(message);
             }
@@ -179,6 +250,7 @@ final class ImmediateEventDispatcher {
 
   private boolean post(String body) throws Exception {
     HttpURLConnection connection = (HttpURLConnection) new URL(batchUrl).openConnection();
+    useSocketFactory(connection);
     try {
       connection.setRequestMethod("POST");
       connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
@@ -217,7 +289,26 @@ final class ImmediateEventDispatcher {
     }
   }
 
-  private static String timestamp() {
+  // TLS sessions kept on disk: a new process resumes the last session with the data plane, a round trip and a
+  // certificate verification shorter than a full handshake. Left unset (the default factory) where it cannot be set up.
+  @SuppressWarnings("deprecation")
+  private static synchronized void initSocketFactory(Context context) {
+    if (socketFactory != null) return;
+    try {
+      socketFactory = SSLCertificateSocketFactory.getDefault(CONNECT_TIMEOUT_MS, new SSLSessionCache(context));
+    } catch (Exception e) {
+      RudderLogger.logDebug("ImmediateEventDispatcher: no TLS session cache: " + e);
+    }
+  }
+
+  private static void useSocketFactory(HttpURLConnection connection) {
+    SSLSocketFactory factory = socketFactory;
+    if (factory != null && connection instanceof HttpsURLConnection) {
+      ((HttpsURLConnection) connection).setSSLSocketFactory(factory);
+    }
+  }
+
+  static String timestamp() {
     SimpleDateFormat format = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
     format.setTimeZone(TimeZone.getTimeZone("UTC"));
     return format.format(new Date());
