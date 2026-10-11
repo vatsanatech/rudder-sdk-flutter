@@ -72,6 +72,31 @@ final class ImmediateEventDispatcher {
     return shared;
   }
 
+  /**
+   * Sends an event built without the client ({@link EarlyEvents#sendFirst}) as the process's first request to the data
+   * plane: no warm-up request runs ahead of it, and messages a killed process left pending are sent after it.
+   */
+  static synchronized void sendFirst(Context context, String writeKey, String dataPlaneUrl, JsonObject event,
+      String messageId) {
+    warmed.set(true);
+    boolean created = shared == null;
+    if (created) shared = new ImmediateEventDispatcher(context.getApplicationContext(), writeKey, dataPlaneUrl);
+    shared.sendStored(event, messageId);
+    if (created) shared.sendPending(messageId);
+  }
+
+  // Stored pending first, so a process killed while it is in flight loses nothing; one not delivered stays pending and
+  // the next process sends it (there is no client yet to queue it with).
+  private void sendStored(final JsonObject event, final String messageId) {
+    pending.edit().putString(messageId, event.toString()).apply();
+    sender.execute(new Runnable() {
+      @Override
+      public void run() {
+        if (deliver(event)) pending.edit().remove(messageId).apply();
+      }
+    });
+  }
+
   ImmediateEventDispatcher(Context context, String writeKey, String dataPlaneUrl) {
     this.pending = context.getSharedPreferences(PENDING_PREFS, Context.MODE_PRIVATE);
     this.rudderPrefs = context.getSharedPreferences(RUDDER_PREFS, Context.MODE_PRIVATE);
@@ -148,15 +173,22 @@ final class ImmediateEventDispatcher {
    * still fails is handed to the SDK queue.
    */
   void sendPending() {
-    final Map<String, ?> stored = pending.getAll();
+    sendPending(null);
+  }
+
+  // Except the message being sent first; one that still fails is queued, or kept pending while there is no client.
+  private void sendPending(String exceptMessageId) {
+    final Map<String, Object> stored = new java.util.HashMap<>(pending.getAll());
+    if (exceptMessageId != null) stored.remove(exceptMessageId);
     if (stored.isEmpty()) return;
     sender.execute(new Runnable() {
       @Override
       public void run() {
-        for (Map.Entry<String, ?> entry : stored.entrySet()) {
+        for (Map.Entry<String, Object> entry : stored.entrySet()) {
           try {
             JsonObject event = JsonParser.parseString(String.valueOf(entry.getValue())).getAsJsonObject();
             if (!deliver(event)) {
+              if (RudderClient.getInstance() == null) continue;
               RudderMessage message = RudderGson.deserialize(event.toString(), RudderMessage.class);
               if (message != null) RudderClient.getInstance().track(message);
             }
@@ -243,7 +275,7 @@ final class ImmediateEventDispatcher {
     }
   }
 
-  private static String timestamp() {
+  static String timestamp() {
     SimpleDateFormat format = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
     format.setTimeZone(TimeZone.getTimeZone("UTC"));
     return format.format(new Date());
